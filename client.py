@@ -6,6 +6,7 @@ server and renders whatever state the server broadcasts back.
 
 import socket
 import threading
+import urllib.request
 
 import pygame
 
@@ -187,6 +188,33 @@ def start_local_server():
     return game_server
 
 
+def get_local_ip():
+    """LAN IP other players on the same network should connect to. Doesn't
+    actually send any packets - just asks the OS which local address it
+    would route through - so this is instant and works offline.
+    """
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        return ip
+    except OSError:
+        return "unknown"
+
+
+def fetch_public_ip(host_info):
+    """Runs in a background thread - a real network request, so it shouldn't
+    block the render loop. Only meaningful once port forwarding is set up.
+    """
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=3) as resp:
+            host_info["public_ip"] = resp.read().decode().strip()
+    except Exception:
+        host_info["public_ip"] = None
+    host_info["public_status"] = "done"
+
+
 def draw_flag(screen, x, y, color):
     pole_x = x + settings.CELL_SIZE * 0.35
     top_y = y + settings.CELL_SIZE * 0.12
@@ -238,6 +266,7 @@ def run():
 
     net = NetworkClient()
     last_sent = (0, 0)
+    host_info = {"local_ip": None, "public_ip": None, "public_status": "not_started"}
 
     # client-side-only animation bookkeeping - none of this is networked state
     destroy_anim = {}  # (col, row) -> start_ticks, brick crumble one-shot
@@ -258,6 +287,9 @@ def run():
                     start_local_server()
                     if net.connect("127.0.0.1", settings.DEFAULT_PORT):
                         state = "game" if net.match_started else "lobby"
+                        host_info["local_ip"] = get_local_ip()
+                        host_info["public_status"] = "fetching"
+                        threading.Thread(target=fetch_public_ip, args=(host_info,), daemon=True).start()
                     else:
                         status_message = f"Failed to connect: {net.error}"
                 elif join_button.clicked(event.pos):
@@ -333,8 +365,24 @@ def run():
             title = font.render("Lobby", True, (240, 240, 240))
             screen.blit(title, title.get_rect(center=(settings.FIELD_WIDTH // 2, 100)))
 
+            if net.player_id == 1:
+                local_ip = host_info["local_ip"] or "..."
+                local_line = small_font.render(
+                    f"LAN: {local_ip}:{settings.DEFAULT_PORT}  (same wifi/network)", True, (180, 210, 255)
+                )
+                screen.blit(local_line, local_line.get_rect(center=(settings.FIELD_WIDTH // 2, 128)))
+
+                if host_info["public_status"] == "fetching":
+                    public_text = "Internet: looking up public IP..."
+                elif host_info["public_ip"]:
+                    public_text = f"Internet: {host_info['public_ip']}:{settings.DEFAULT_PORT}  (needs port forwarding set up)"
+                else:
+                    public_text = "Internet: unavailable (no connection?)"
+                public_line = small_font.render(public_text, True, (170, 170, 170))
+                screen.blit(public_line, public_line.get_rect(center=(settings.FIELD_WIDTH // 2, 150)))
+
             roster = net.render_state()["players"]
-            list_top = 160
+            list_top = 185
             if not roster:
                 waiting = small_font.render("Waiting for players to connect...", True, (180, 180, 180))
                 screen.blit(waiting, waiting.get_rect(center=(settings.FIELD_WIDTH // 2, list_top)))
@@ -462,7 +510,18 @@ def run():
                     continue
 
                 direction_frames = sprites.player_walk[team][p.get("facing", "down")]
-                frame = anim_frame(0, now_ticks, settings.WALK_FRAME_MS, len(direction_frames)) if p.get("is_moving") else 0
+                if p.get("is_moving"):
+                    # scale frame duration by actual speed (relative to the configured
+                    # base speed) so the walk cycle always takes roughly one cell
+                    # crossing to complete a loop, whether at normal speed, slowed
+                    # down for testing, superspeed, flag-carry, etc. - a fixed frame
+                    # duration would desync from a much slower or faster crossing and
+                    # look like it's repeating/stuck even though position is moving fine
+                    speed_ratio = max(0.1, p.get("cells_per_sec", settings.GRID_MOVE_SPEED)) / settings.GRID_MOVE_SPEED
+                    frame_ms = max(20, round(settings.WALK_FRAME_MS / speed_ratio))
+                    frame = anim_frame(0, now_ticks, frame_ms, len(direction_frames))
+                else:
+                    frame = 0
                 sprite = direction_frames[frame]
                 if p.get("disease") and blink_phase in (1, 3):
                     sprite = sprite.copy()

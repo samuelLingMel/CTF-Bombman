@@ -240,23 +240,19 @@ class Player:
 
         if dx != move_dx or dy != move_dy:
             # input no longer matches the direction of travel (released, or a
-            # perpendicular tap). A perpendicular direction doesn't turn
-            # instantly - the player keeps sliding toward whichever outer
-            # checkpoint (10%/90%) is closer, same speed as normal movement,
-            # and only pivots into the new direction once they arrive there.
-            # A plain release just holds at the nearest checkpoint instead.
+            # perpendicular tap). Neither case teleports the hitbox straight
+            # to its target checkpoint - the visual position always glides
+            # there at the normal movement rate, so it never looks like a
+            # different (instant) speed than regular movement. Only *which*
+            # checkpoint is being aimed for differs between the two cases.
             if dx or dy:
+                # perpendicular tap: aim for whichever outer checkpoint
+                # (10%/90%) is closer, then pivot into the new direction
                 progress = self._progress()
                 approach_forward = progress >= 0.5  # True -> finish toward 90%, False -> ease back to 10%
-                checkpoint = settings.MOVE_CHECKPOINTS[-1] if approach_forward else settings.MOVE_CHECKPOINTS[0]
-                checkpoint_x, checkpoint_y = self._position_at_progress(checkpoint)
+                target = settings.MOVE_CHECKPOINTS[-1] if approach_forward else settings.MOVE_CHECKPOINTS[0]
 
-                step_amount = self._cells_per_sec() * settings.CELL_SIZE * dt
-                remaining_x = checkpoint_x - self.x
-                remaining_y = checkpoint_y - self.y
-
-                if abs(remaining_x) + abs(remaining_y) <= step_amount:
-                    # reached the checkpoint - commit to the resolved cell and pivot
+                if self._approach_progress(dt, target):
                     if approach_forward:
                         self.x, self.y = self.target_col * settings.CELL_SIZE, self.target_row * settings.CELL_SIZE
                         self.col, self.row = self.target_col, self.target_row
@@ -264,16 +260,12 @@ class Player:
                         self.x, self.y = self.col * settings.CELL_SIZE, self.row * settings.CELL_SIZE
                     self.target_col = self.target_row = None
                     self.step(dt, blocked_cells)  # re-enter idle so the new direction starts this tick
-                    return
-
-                self.is_moving = True
-                if remaining_x != 0:
-                    self.x += step_amount if remaining_x > 0 else -step_amount
-                else:
-                    self.y += step_amount if remaining_y > 0 else -step_amount
                 return
 
-            self._snap_to_nearest_checkpoint()
+            # plain release: aim for the nearest of all 5 checkpoints and just
+            # hold there once reached (no cell commit - still mid-crossing)
+            nearest = min(settings.MOVE_CHECKPOINTS, key=lambda c: abs(c - self._progress()))
+            self._approach_progress(dt, nearest)
             return
 
         target_x = self.target_col * settings.CELL_SIZE
@@ -316,9 +308,27 @@ class Player:
         target_y = self.target_row * settings.CELL_SIZE
         return origin_x + (target_x - origin_x) * progress, origin_y + (target_y - origin_y) * progress
 
-    def _snap_to_nearest_checkpoint(self):
-        progress = min(settings.MOVE_CHECKPOINTS, key=lambda c: abs(c - self._progress()))
-        self.x, self.y = self._position_at_progress(progress)
+    def _approach_progress(self, dt, target_progress):
+        """Move step_amount toward the given progress point along the current
+        crossing, at the normal movement rate - never teleports. Returns True
+        once it actually arrives there (the caller decides what "arrived"
+        means: commit to a cell, or just hold at that fractional position).
+        """
+        target_x, target_y = self._position_at_progress(target_progress)
+        step_amount = self._cells_per_sec() * settings.CELL_SIZE * dt
+        remaining_x = target_x - self.x
+        remaining_y = target_y - self.y
+
+        if abs(remaining_x) + abs(remaining_y) <= step_amount:
+            self.x, self.y = target_x, target_y
+            return True
+
+        self.is_moving = True
+        if remaining_x != 0:
+            self.x += step_amount if remaining_x > 0 else -step_amount
+        else:
+            self.y += step_amount if remaining_y > 0 else -step_amount
+        return False
 
     def occupied_cells(self):
         """Cell(s) this player's hitbox counts as touching, for collision
@@ -768,6 +778,7 @@ class GameServer:
                             "speed_bonus": p.speed_bonus, "disease": p.disease,
                             "has_kick": p.has_kick, "has_remote": p.has_remote,
                             "facing": p.facing, "is_moving": p.is_moving,
+                            "cells_per_sec": p._cells_per_sec(),
                         }
                         for pid, p in self.players.items()
                     },
