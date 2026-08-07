@@ -2,6 +2,13 @@ DEFAULT_PORT = 5555
 TICK_RATE = 30
 TICK_INTERVAL = 1 / TICK_RATE
 
+MAX_NAME_LENGTH = 16
+# How long the server waits, right after accepting a connection, for the
+# client's "hello" (display name) message before giving up and falling back
+# to a generic name - so a slow/misbehaving client can't stall the accept
+# thread forever.
+NAME_HANDSHAKE_TIMEOUT_SECONDS = 5.0
+
 # How far behind real-time the client renders, so it can always interpolate
 # between two already-confirmed positions instead of guessing ahead of the
 # latest one. Guessing ahead (dead reckoning) looks smooth until timing
@@ -63,13 +70,14 @@ TEAM_COLORS = [
     (220, 60, 60),
     (60, 120, 220),
 ]
+UNASSIGNED_COLOR = (150, 150, 160)  # players in the lobby who haven't picked a team yet
 FLAG_HOMES = [
     (0, GRID_ROWS // 2),               # team 0 (Red) - west edge
     (GRID_COLS - 1, GRID_ROWS // 2),   # team 1 (Blue) - east edge
 ]
 
 FLAG_CARRY_SPEED = 3.5  # cells/sec, replaces the carrier's normal speed entirely (not a multiplier)
-CAPTURES_TO_WIN = 3
+CAPTURES_TO_WIN = 2
 
 # Power-ups: a destroyed soft wall has a chance to reveal one. They sit on the
 # ground until picked up (or wiped out by a later blast passing over them),

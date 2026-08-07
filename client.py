@@ -21,8 +21,10 @@ class NetworkClient:
         self.sock = None
         self.reader = None
         self.player_id = None
+        self.name = None
         self.team = None
-        self.match_started = False
+        self.phase = "lobby"  # "lobby" | "playing" | "finished"
+        self.host_ended = False  # True if the host chose "Back to Main Menu" (vs. a real disconnect)
         self.players = {}
         self.prev_players = {}  # previous "state" snapshot, for interpolating render position
         self.state_tick_ms = 0  # local time (ms) the current snapshot arrived
@@ -40,7 +42,7 @@ class NetworkClient:
         self.connected = False
         self.error = None
 
-    def connect(self, host, port):
+    def connect(self, host, port, name):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
@@ -52,6 +54,16 @@ class NetworkClient:
 
         self.sock = sock
         self.reader = MessageReader(sock)
+        self.name = name
+        try:
+            # sent immediately, ahead of the "welcome" reply - the server
+            # blocks briefly waiting for this before it creates our Player,
+            # so our name is already in place for the very first roster.
+            send_message(sock, {"type": "hello", "name": name})
+        except OSError as e:
+            self.error = str(e)
+            return False
+
         self.connected = True
         threading.Thread(target=self._listen_loop, daemon=True).start()
         return True
@@ -73,7 +85,7 @@ class NetworkClient:
         if msg_type == "welcome":
             self.player_id = msg["player_id"]
             self.team = msg["team"]
-            self.match_started = msg.get("match_started", False)
+            self.phase = msg.get("phase", "lobby")
             self.hard_walls = {tuple(cell) for cell in msg["walls"]["hard"]}
             self.soft_walls = {tuple(cell) for cell in msg["walls"]["soft"]}
         elif msg_type == "state":
@@ -89,12 +101,26 @@ class NetworkClient:
                 self.flags = msg.get("flags", {})
                 self.scores = msg.get("scores", {})
                 self.winner = msg.get("winner")
-                self.match_started = msg.get("match_started", self.match_started)
+                self.phase = msg.get("phase", self.phase)
+                # our own team can change in the lobby (host-assigned, or
+                # auto-balanced when the host starts) - the "welcome" team is
+                # just the initial one
+                own = self.players.get(str(self.player_id))
+                if own is not None:
+                    self.team = own.get("team", self.team)
         elif msg_type == "wall_destroyed":
             cell = tuple(msg["cell"])
             self.soft_walls.discard(cell)
             with self.lock:
                 self.recent_destructions.append(cell)
+        elif msg_type == "walls_reset":
+            # the map regenerated (a "replay" rematch) - full replace, unlike
+            # the incremental wall_destroyed above
+            self.hard_walls = {tuple(cell) for cell in msg["hard"]}
+            self.soft_walls = {tuple(cell) for cell in msg["soft"]}
+        elif msg_type == "game_ended":
+            self.host_ended = True
+            self.connected = False
 
     def drain_destructions(self):
         with self.lock:
@@ -131,6 +157,38 @@ class NetworkClient:
             return
         try:
             send_message(self.sock, {"type": "start_match"})
+        except OSError:
+            self.connected = False
+
+    def send_assign_team(self, target_player_id, team):
+        if not self.connected:
+            return
+        try:
+            send_message(self.sock, {"type": "assign_team", "player_id": int(target_player_id), "team": team})
+        except OSError:
+            self.connected = False
+
+    def send_replay(self):
+        if not self.connected:
+            return
+        try:
+            send_message(self.sock, {"type": "replay"})
+        except OSError:
+            self.connected = False
+
+    def send_change_teams(self):
+        if not self.connected:
+            return
+        try:
+            send_message(self.sock, {"type": "change_teams"})
+        except OSError:
+            self.connected = False
+
+    def send_end_game(self):
+        if not self.connected:
+            return
+        try:
+            send_message(self.sock, {"type": "end_game"})
         except OSError:
             self.connected = False
 
@@ -227,6 +285,18 @@ def draw_flag(screen, x, y, color):
     ])
 
 
+def draw_nameplate(screen, small_font, text, center_x, sprite_top_y):
+    """Small "name(id)" label centered just above a player's sprite, with a
+    translucent backdrop so it stays readable over any background tile.
+    """
+    text_surf = small_font.render(text, True, (255, 255, 255))
+    rect = text_surf.get_rect(midbottom=(center_x, sprite_top_y - 2))
+    backdrop = pygame.Surface((rect.width + 6, rect.height + 2), pygame.SRCALPHA)
+    backdrop.fill((0, 0, 0, 130))
+    screen.blit(backdrop, (rect.x - 3, rect.y - 1))
+    screen.blit(text_surf, rect)
+
+
 def anim_frame(start_ticks, now_ticks, frame_ms, frame_count, loop=True):
     index = (now_ticks - start_ticks) // frame_ms
     return int(index) % frame_count if loop else min(int(index), frame_count - 1)
@@ -257,16 +327,33 @@ def run():
     sprites = sprites_module.load_sprites()  # must load after set_mode (needs a display surface)
 
     state = "menu"
-    host_button = Button((300, 220, 200, 50), "Host Game")
-    join_button = Button((300, 290, 200, 50), "Join Game")
-    start_match_button = Button((300, 460, 200, 50), "Start Game")
+    host_button = Button((300, 240, 200, 50), "Host Game")
+    join_button = Button((300, 310, 200, 50), "Join Game")
+    # centered under the Red/Blue roster columns drawn in the lobby - the
+    # lobby owner selects a player (click their row), then one of these to
+    # place them on that team
+    assign_red_button = Button((97, 400, 180, 45), "Assign -> Red")
+    assign_blue_button = Button((573, 400, 180, 45), "Assign -> Blue")
+    start_match_button = Button((300, 480, 200, 50), "Start Game")
 
+    finished_button_y = settings.FIELD_HEIGHT // 2 + 50
+    replay_button = Button((135, finished_button_y, 180, 50), "Replay")
+    change_teams_button = Button((355, finished_button_y, 180, 50), "Change Teams")
+    back_menu_button = Button((575, finished_button_y, 180, 50), "Main Menu")
+
+    name_text = "Player"
     join_text = ""
     status_message = ""
+    selected_pid = None  # lobby: the player row the owner clicked, awaiting an Assign click
+    lobby_rows = []  # [(pid, rect), ...] - rebuilt each lobby draw, hit-tested against on the next frame's click
 
     net = NetworkClient()
+    local_server = None  # the GameServer this client is hosting, if any - so "Main Menu" can free the port
     last_sent = (0, 0)
     host_info = {"local_ip": None, "public_ip": None, "public_status": "not_started"}
+
+    def state_for_phase(phase):
+        return {"lobby": "lobby", "playing": "game", "finished": "finished"}.get(phase, "lobby")
 
     # client-side-only animation bookkeeping - none of this is networked state
     destroy_anim = {}  # (col, row) -> start_ticks, brick crumble one-shot
@@ -284,9 +371,10 @@ def run():
 
             elif state == "menu" and event.type == pygame.MOUSEBUTTONDOWN:
                 if host_button.clicked(event.pos):
-                    start_local_server()
-                    if net.connect("127.0.0.1", settings.DEFAULT_PORT):
-                        state = "game" if net.match_started else "lobby"
+                    display_name = name_text.strip() or "Player"
+                    local_server = start_local_server()
+                    if net.connect("127.0.0.1", settings.DEFAULT_PORT, display_name):
+                        state = state_for_phase(net.phase)
                         host_info["local_ip"] = get_local_ip()
                         host_info["public_status"] = "fetching"
                         threading.Thread(target=fetch_public_ip, args=(host_info,), daemon=True).start()
@@ -296,12 +384,19 @@ def run():
                     state = "join_input"
                     join_text = ""
 
+            elif state == "menu" and event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_BACKSPACE:
+                    name_text = name_text[:-1]
+                elif event.unicode.isprintable() and len(name_text) < settings.MAX_NAME_LENGTH:
+                    name_text += event.unicode
+
             elif state == "join_input" and event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     state = "menu"
                 elif event.key == pygame.K_RETURN:
-                    if net.connect(join_text.strip(), settings.DEFAULT_PORT):
-                        state = "game" if net.match_started else "lobby"
+                    display_name = name_text.strip() or "Player"
+                    if net.connect(join_text.strip(), settings.DEFAULT_PORT, display_name):
+                        state = state_for_phase(net.phase)
                     else:
                         status_message = f"Failed to connect: {net.error}"
                         state = "menu"
@@ -310,9 +405,35 @@ def run():
                 elif event.unicode.isprintable():
                     join_text += event.unicode
 
-            elif state == "lobby" and event.type == pygame.MOUSEBUTTONDOWN:
-                if net.player_id == 1 and start_match_button.clicked(event.pos):
+            elif state == "lobby" and event.type == pygame.MOUSEBUTTONDOWN and net.player_id == 1:
+                if start_match_button.clicked(event.pos):
                     net.send_start_match()
+                elif assign_red_button.clicked(event.pos):
+                    if selected_pid is not None:
+                        net.send_assign_team(selected_pid, 0)
+                elif assign_blue_button.clicked(event.pos):
+                    if selected_pid is not None:
+                        net.send_assign_team(selected_pid, 1)
+                else:
+                    for pid, rect in lobby_rows:
+                        if rect.collidepoint(event.pos):
+                            selected_pid = pid
+                            break
+
+            elif state == "finished" and event.type == pygame.MOUSEBUTTONDOWN and net.player_id == 1:
+                if replay_button.clicked(event.pos):
+                    net.send_replay()
+                elif change_teams_button.clicked(event.pos):
+                    net.send_change_teams()
+                elif back_menu_button.clicked(event.pos):
+                    net.send_end_game()
+                    if local_server is not None:
+                        local_server.shutdown()  # belt-and-suspenders in case the round-trip lags
+                        local_server = None
+                    net = NetworkClient()
+                    selected_pid = None
+                    status_message = ""
+                    state = "menu"
 
             elif state == "game" and event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
@@ -320,17 +441,17 @@ def run():
                 elif event.key == pygame.K_e:
                     net.send_detonate()
 
-        if state == "lobby":
-            if not net.connected:
-                status_message = "Disconnected from server."
-                state = "menu"
-            elif net.match_started:
+        if state in ("lobby", "game", "finished") and not net.connected:
+            status_message = "Host ended the game." if net.host_ended else "Disconnected from server."
+            state = "menu"
+
+        elif state == "lobby":
+            if net.phase == "playing":
                 state = "game"
 
-        if state == "game":
-            if not net.connected:
-                status_message = "Disconnected from server."
-                state = "menu"
+        elif state == "game":
+            if net.phase == "finished":
+                state = "finished"
             else:
                 keys = pygame.key.get_pressed()
                 dx = (keys[pygame.K_d] or keys[pygame.K_RIGHT]) - (keys[pygame.K_a] or keys[pygame.K_LEFT])
@@ -339,16 +460,32 @@ def run():
                     net.send_input(dx, dy)
                     last_sent = (dx, dy)
 
+        elif state == "finished":
+            if net.phase == "lobby":
+                selected_pid = None
+                state = "lobby"
+            elif net.phase == "playing":
+                state = "game"
+
         screen.fill((30, 30, 40))
 
         if state == "menu":
             title = font.render("Bomberman CTF", True, (240, 240, 240))
-            screen.blit(title, title.get_rect(center=(settings.FIELD_WIDTH // 2, 140)))
+            screen.blit(title, title.get_rect(center=(settings.FIELD_WIDTH // 2, 120)))
+
+            name_label = small_font.render("Your name:", True, (200, 200, 200))
+            screen.blit(name_label, name_label.get_rect(center=(settings.FIELD_WIDTH // 2, 165)))
+            name_box = pygame.Rect(250, 183, 300, 40)
+            pygame.draw.rect(screen, (50, 50, 65), name_box)
+            pygame.draw.rect(screen, (200, 200, 220), name_box, width=2)
+            name_surf = font.render(name_text, True, (240, 240, 240))
+            screen.blit(name_surf, (name_box.x + 8, name_box.y + 8))
+
             host_button.draw(screen, font)
             join_button.draw(screen, font)
             if status_message:
                 msg = small_font.render(status_message, True, (255, 150, 150))
-                screen.blit(msg, msg.get_rect(center=(settings.FIELD_WIDTH // 2, 370)))
+                screen.blit(msg, msg.get_rect(center=(settings.FIELD_WIDTH // 2, 400)))
 
         elif state == "join_input":
             prompt = font.render("Enter host IP, then press Enter:", True, (240, 240, 240))
@@ -382,26 +519,61 @@ def run():
                 screen.blit(public_line, public_line.get_rect(center=(settings.FIELD_WIDTH // 2, 150)))
 
             roster = net.render_state()["players"]
-            list_top = 185
+            header_y = 180
+            list_top = 205
+            is_owner = net.player_id == 1
+
+            # three columns: each team's roster either side, players the
+            # owner hasn't assigned yet in the middle
+            columns = [
+                (0, settings.FIELD_WIDTH * 0.22, f"Team {settings.TEAM_NAMES[0]}", settings.TEAM_COLORS[0]),
+                (None, settings.FIELD_WIDTH * 0.5, "Unassigned", settings.UNASSIGNED_COLOR),
+                (1, settings.FIELD_WIDTH * 0.78, f"Team {settings.TEAM_NAMES[1]}", settings.TEAM_COLORS[1]),
+            ]
+            for _, x, label, color in columns:
+                header = small_font.render(label, True, color)
+                screen.blit(header, header.get_rect(center=(x, header_y)))
+
             if not roster:
                 waiting = small_font.render("Waiting for players to connect...", True, (180, 180, 180))
                 screen.blit(waiting, waiting.get_rect(center=(settings.FIELD_WIDTH // 2, list_top)))
-            for i, (pid, p) in enumerate(sorted(roster.items(), key=lambda kv: int(kv[0]))):
-                team = p.get("team", 0)
-                team_name = settings.TEAM_NAMES[team]
-                color = settings.TEAM_COLORS[team]
-                you_tag = "  (you)" if str(pid) == str(net.player_id) else ""
-                host_tag = "  [HOST]" if pid == "1" else ""
-                line = small_font.render(f"Player {pid} - Team {team_name}{host_tag}{you_tag}", True, color)
-                screen.blit(line, line.get_rect(center=(settings.FIELD_WIDTH // 2, list_top + i * 28)))
 
-            if net.player_id == 1:
+            lobby_rows = []
+            sorted_roster = sorted(roster.items(), key=lambda kv: int(kv[0]))
+            for team_key, x, _, color in columns:
+                members = [(pid, p) for pid, p in sorted_roster if p.get("team") == team_key]
+                for i, (pid, p) in enumerate(members):
+                    display_name = p.get("name") or f"Player{pid}"
+                    you_tag = "  (you)" if str(pid) == str(net.player_id) else ""
+                    host_tag = "  [HOST]" if pid == "1" else ""
+                    row_y = list_top + i * 24
+                    line = small_font.render(f"{display_name}({pid}){host_tag}{you_tag}", True, color)
+                    line_rect = line.get_rect(center=(x, row_y))
+
+                    if is_owner:
+                        click_rect = line_rect.inflate(16, 6)
+                        lobby_rows.append((pid, click_rect))
+                        if pid == selected_pid:
+                            pygame.draw.rect(screen, (90, 90, 120), click_rect, border_radius=4)
+                            pygame.draw.rect(screen, (230, 230, 240), click_rect, width=1, border_radius=4)
+
+                    screen.blit(line, line_rect)
+
+            if is_owner:
+                assign_red_button.draw(screen, font)
+                assign_blue_button.draw(screen, font)
+                hint_text = (
+                    f"Selected: {selected_pid}  -  click Assign" if selected_pid is not None
+                    else "Click a player, then Assign -> Red/Blue"
+                )
+                hint = small_font.render(hint_text, True, (180, 180, 190))
+                screen.blit(hint, hint.get_rect(center=(settings.FIELD_WIDTH // 2, 460)))
                 start_match_button.draw(screen, font)
             else:
-                waiting = small_font.render("Waiting for the host to start...", True, (200, 200, 200))
-                screen.blit(waiting, waiting.get_rect(center=(settings.FIELD_WIDTH // 2, 475)))
+                waiting = small_font.render("Waiting for the host to assign teams and start...", True, (200, 200, 200))
+                screen.blit(waiting, waiting.get_rect(center=(settings.FIELD_WIDTH // 2, 505)))
 
-        elif state == "game":
+        elif state in ("game", "finished"):
             now_ticks = pygame.time.get_ticks()
 
             for col in range(settings.GRID_COLS):
@@ -536,9 +708,13 @@ def run():
                 if str(pid) == str(net.player_id):
                     pygame.draw.rect(screen, (255, 255, 255), (*pos, sprite.get_width(), sprite.get_height()), width=2)
 
+                nameplate = p.get("name") or f"Player{pid}"
+                draw_nameplate(screen, small_font, f"{nameplate}({pid})", pos[0] + sprite.get_width() // 2, pos[1])
+
             team_name = settings.TEAM_NAMES[net.team] if net.team is not None else "?"
+            own_name = net.name or f"Player{net.player_id}"
             hud = small_font.render(
-                f"Player {net.player_id} (Team {team_name})  |  Space: bomb  |  E: detonate", True, (220, 220, 220)
+                f"{own_name}({net.player_id})  Team {team_name}  |  Space: bomb  |  E: detonate", True, (220, 220, 220)
             )
             screen.blit(hud, (10, 10))
 
@@ -561,8 +737,31 @@ def run():
             if winner is not None:
                 banner = font.render(f"{settings.TEAM_NAMES[winner]} TEAM WINS!", True, (255, 230, 120))
                 banner_rect = banner.get_rect(center=(settings.FIELD_WIDTH // 2, settings.FIELD_HEIGHT // 2))
-                pygame.draw.rect(screen, (20, 20, 25), banner_rect.inflate(24, 16))
+
+                if state == "finished":
+                    panel = pygame.Rect(0, 0, 460, 150)
+                    panel.center = (settings.FIELD_WIDTH // 2, settings.FIELD_HEIGHT // 2 + 25)
+                    overlay = pygame.Surface(panel.size, pygame.SRCALPHA)
+                    overlay.fill((15, 15, 20, 210))
+                    screen.blit(overlay, panel)
+                    pygame.draw.rect(screen, (200, 200, 220), panel, width=2, border_radius=8)
+                else:
+                    pygame.draw.rect(screen, (20, 20, 25), banner_rect.inflate(24, 16))
+
                 screen.blit(banner, banner_rect)
+
+                if state == "finished":
+                    if net.player_id == 1:
+                        replay_button.draw(screen, font)
+                        change_teams_button.draw(screen, font)
+                        back_menu_button.draw(screen, font)
+                    else:
+                        waiting = small_font.render(
+                            "Waiting for the host to choose what's next...", True, (200, 200, 200)
+                        )
+                        screen.blit(waiting, waiting.get_rect(
+                            center=(settings.FIELD_WIDTH // 2, finished_button_y + 25)
+                        ))
 
         pygame.display.flip()
 

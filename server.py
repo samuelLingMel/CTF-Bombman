@@ -136,8 +136,9 @@ class Flag:
 
 
 class Player:
-    def __init__(self, player_id, color, spawn_col, spawn_row, team):
+    def __init__(self, player_id, color, spawn_col, spawn_row, team, name):
         self.id = player_id
+        self.name = name
         self.color = color
         self.team = team
         self.spawn_col = spawn_col
@@ -374,18 +375,22 @@ class GameServer:
         self.scores = {team: 0 for team in range(settings.TEAM_COUNT)}
         self.winner = None
 
-        self.match_started = False  # gameplay is frozen in a lobby until the host starts the match
+        # "lobby" - frozen, host picks teams and starts
+        # "playing" - live gameplay
+        # "finished" - a team hit the win score; frozen until the host replays/re-teams/ends it
+        self.phase = "lobby"
+        self.server_sock = None  # set once start() binds it; closed by shutdown() to free the port
 
     def start(self):
         self.running = True
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(("0.0.0.0", self.port))
-        server_sock.listen()
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind(("0.0.0.0", self.port))
+        self.server_sock.listen()
         print(f"[SERVER] Listening on port {self.port}")
         self.ready.set()
 
-        threading.Thread(target=self._accept_loop, args=(server_sock,), daemon=True).start()
+        threading.Thread(target=self._accept_loop, args=(self.server_sock,), daemon=True).start()
         self._tick_loop()
 
     def _accept_loop(self, server_sock):
@@ -396,29 +401,141 @@ class GameServer:
                 break
             threading.Thread(target=self._handle_client, args=(client_sock, addr), daemon=True).start()
 
+    def shutdown(self):
+        """Ends the whole match for everyone (the host's "Back to Main Menu"
+        action) - tells every connected client why, then closes their sockets
+        and the listening socket itself so the port is immediately free for
+        the host to host a new game again.
+        """
+        with self.lock:
+            self.running = False
+            clients_snapshot = dict(self.clients)
+        for sock in clients_snapshot.values():
+            try:
+                send_message(sock, {"type": "game_ended"})
+            except OSError:
+                pass
+        for sock in clients_snapshot.values():
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if self.server_sock is not None:
+            try:
+                self.server_sock.close()
+            except OSError:
+                pass
+
+    def _read_name(self, client_sock, reader):
+        """Blocks briefly for the "hello" message a client sends immediately
+        after connecting, to learn their chosen display name. Falls back to
+        "" (caller defaults to "Player<id>") if it doesn't arrive in time,
+        is malformed, or the socket closes first - a slow/odd client
+        shouldn't be able to stall this connection's setup indefinitely.
+        """
+        client_sock.settimeout(settings.NAME_HANDSHAKE_TIMEOUT_SECONDS)
+        try:
+            while True:
+                messages = reader.read_messages()
+                if messages is None:
+                    break
+                for msg in messages:
+                    if msg.get("type") == "hello":
+                        return str(msg.get("name", "")).strip()[:settings.MAX_NAME_LENGTH]
+        except OSError:
+            pass
+        finally:
+            client_sock.settimeout(None)
+        return ""
+
+    def _balanced_team(self):
+        """Whichever team currently has fewer assigned players - ties go to
+        team 0. Used to auto-place a player who never picked one themselves.
+        """
+        counts = [0] * settings.TEAM_COUNT
+        for player in self.players.values():
+            if player.team is not None:
+                counts[player.team] += 1
+        return min(range(settings.TEAM_COUNT), key=lambda t: (counts[t], t))
+
+    def _assign_team(self, player, team):
+        player.team = team
+        player.color = settings.TEAM_COLORS[team]
+        player.spawn_col, player.spawn_row = settings.PLAYER_SPAWNS[team]
+        player.col, player.row = player.spawn_col, player.spawn_row
+        player.x = float(player.col * settings.CELL_SIZE)
+        player.y = float(player.row * settings.CELL_SIZE)
+
+    def _reset_match_state(self):
+        """Fresh map, fresh scores, everyone back at their spawn with base
+        stats - used both for the very first "start_match" and for a
+        "replay" rematch, so both paths guarantee a clean board.
+        """
+        self.hard_walls, self.soft_walls = generate_walls()
+        self.blocked_cells = self.hard_walls | self.soft_walls
+        self.bombs = {}
+        self.active_blasts = []
+        self.power_ups = {}
+        for flag in self.flags.values():
+            flag.return_home()
+        self.scores = {team: 0 for team in range(settings.TEAM_COUNT)}
+        self.winner = None
+        for player in self.players.values():
+            player.respawn()
+
+    def _broadcast_walls(self):
+        """Pushes the current map to already-connected clients - needed
+        whenever the map regenerates mid-session (replay), since "welcome"
+        only delivers walls once, at connect time.
+        """
+        message = {"type": "walls_reset", "hard": sorted(self.hard_walls), "soft": sorted(self.soft_walls)}
+        for sock in self.clients.values():
+            try:
+                send_message(sock, message)
+            except OSError:
+                pass
+
     def _handle_client(self, client_sock, addr):
+        reader = MessageReader(client_sock)
+        name = self._read_name(client_sock, reader)
+
         with self.lock:
             player_id = self.next_id
             self.next_id += 1
-            team = (player_id - 1) % settings.TEAM_COUNT
-            color = settings.TEAM_COLORS[team]
-            spawn_col, spawn_row = settings.PLAYER_SPAWNS[team]
-            self.players[player_id] = Player(player_id, color, spawn_col, spawn_row, team)
+
+            if self.phase == "lobby":
+                # unassigned until the host assigns them a team from the
+                # lobby (or starts the match and leftover players get
+                # auto-balanced)
+                team = None
+                color = settings.UNASSIGNED_COLOR
+                spawn_col, spawn_row = settings.PLAYER_SPAWNS[0]  # placeholder, unused until a team is chosen
+            else:
+                # joining mid-match or between rounds (e.g. a reconnect) -
+                # no lobby to sit unassigned in, so slot them straight onto
+                # whichever team is short
+                team = self._balanced_team()
+                color = settings.TEAM_COLORS[team]
+                spawn_col, spawn_row = settings.PLAYER_SPAWNS[team]
+
+            self.players[player_id] = Player(
+                player_id, color, spawn_col, spawn_row, team, name or f"Player{player_id}"
+            )
             self.clients[player_id] = client_sock
 
-        print(f"[SERVER] Player {player_id} connected from {addr} on team {settings.TEAM_NAMES[team]}")
+        team_label = settings.TEAM_NAMES[team] if team is not None else "Unassigned"
+        print(f"[SERVER] Player {player_id} ({self.players[player_id].name}) connected from {addr} - {team_label}")
         send_message(client_sock, {
             "type": "welcome",
             "player_id": player_id,
             "team": team,
-            "match_started": self.match_started,
+            "phase": self.phase,
             "walls": {
                 "hard": sorted(self.hard_walls),
                 "soft": sorted(self.soft_walls),
             },
         })
 
-        reader = MessageReader(client_sock)
         try:
             while self.running:
                 messages = reader.read_messages()
@@ -449,13 +566,55 @@ class GameServer:
         elif msg_type == "detonate":
             with self.lock:
                 self._detonate(player_id)
+        elif msg_type == "assign_team":
+            # only the lobby owner assigns teams (of anyone, including
+            # themselves), and only while there's a lobby to assign in
+            with self.lock:
+                if player_id != 1 or self.phase != "lobby":
+                    return
+                target = self.players.get(msg.get("player_id"))
+                team = msg.get("team")
+                if target is not None and isinstance(team, int) and 0 <= team < settings.TEAM_COUNT:
+                    self._assign_team(target, team)
         elif msg_type == "start_match":
             with self.lock:
-                if player_id == 1:  # the host is whoever connected first
-                    self.match_started = True
+                if player_id == 1 and self.phase == "lobby":  # the host is whoever connected first
+                    # anyone the host never assigned gets auto-balanced onto
+                    # whichever side is short, rather than blocking the start
+                    for player in self.players.values():
+                        if player.team is None:
+                            self._assign_team(player, self._balanced_team())
+                    self._reset_match_state()
+                    self.phase = "playing"
+                    do_broadcast_walls = True
+                else:
+                    do_broadcast_walls = False
+            if do_broadcast_walls:
+                self._broadcast_walls()
+        elif msg_type == "replay":
+            # same teams, fresh map and stats - a quick rematch
+            with self.lock:
+                if player_id == 1 and self.phase == "finished":
+                    self._reset_match_state()
+                    self.phase = "playing"
+                    do_broadcast_walls = True
+                else:
+                    do_broadcast_walls = False
+            if do_broadcast_walls:
+                self._broadcast_walls()
+        elif msg_type == "change_teams":
+            # back to the lobby with teams intact, so the host can reassign
+            # before the next start_match resets the board
+            with self.lock:
+                if player_id == 1 and self.phase == "finished":
+                    self.winner = None
+                    self.phase = "lobby"
+        elif msg_type == "end_game":
+            if player_id == 1:
+                self.shutdown()
 
     def _detonate(self, player_id):
-        if not self.match_started:
+        if self.phase != "playing":
             return
         player = self.players.get(player_id)
         if player is None or not player.has_remote:
@@ -465,7 +624,7 @@ class GameServer:
                 bomb.force_detonate = True
 
     def _place_bomb(self, player_id):
-        if not self.match_started:
+        if self.phase != "playing":
             return
         player = self.players.get(player_id)
         if player is None:
@@ -712,6 +871,7 @@ class GameServer:
                     flag.return_home()
                     if self.scores[carrier.team] >= settings.CAPTURES_TO_WIN:
                         self.winner = carrier.team
+                        self.phase = "finished"  # freezes the board; host picks replay/re-team/menu next
                 continue
 
             # not carried: check for an enemy stealing it, or a teammate
@@ -736,44 +896,47 @@ class GameServer:
             with self.lock:
                 carrier_ids = {f.carrier_id for f in self.flags.values() if f.state == "carried"}
                 bomb_cells = set(self.bombs.keys())
-                for player in self.players.values():
-                    # a speed-changing disease takes priority over the flag-carry
-                    # speed if a player somehow has both at once
-                    if player.disease == "superspeed":
-                        player.speed_override = settings.DISEASE_SUPERSPEED
-                    elif player.disease == "slowdown":
-                        player.speed_override = settings.DISEASE_SLOWDOWN
-                    elif player.id in carrier_ids:
-                        player.speed_override = settings.FLAG_CARRY_SPEED
-                    else:
-                        player.speed_override = None
+                destroyed_walls = []
 
-                    if not self.match_started:
-                        continue  # frozen in the lobby until the host starts the match
+                # frozen in the lobby (pre-game) and once finished (a team hit
+                # the win score) - only "playing" actually simulates anything
+                if self.phase == "playing":
+                    for player in self.players.values():
+                        # a speed-changing disease takes priority over the flag-carry
+                        # speed if a player somehow has both at once
+                        if player.disease == "superspeed":
+                            player.speed_override = settings.DISEASE_SUPERSPEED
+                        elif player.disease == "slowdown":
+                            player.speed_override = settings.DISEASE_SLOWDOWN
+                        elif player.id in carrier_ids:
+                            player.speed_override = settings.FLAG_CARRY_SPEED
+                        else:
+                            player.speed_override = None
 
-                    # ghost-walk passes through soft walls and bombs, but not the truly indestructible ones
-                    blocked = self.hard_walls if player.disease == "walk_through_walls" else self.blocked_cells
-                    if player.has_kick and player.disease != "walk_through_walls":
-                        intended = player.intended_target()
-                        bomb = self.bombs.get(intended)
-                        if bomb is not None and bomb.move_dx == 0 and bomb.move_dy == 0:
-                            bomb.move_dx = intended[0] - player.col
-                            bomb.move_dy = intended[1] - player.row
-                        blocked = blocked - bomb_cells
+                        # ghost-walk passes through soft walls and bombs, but not the truly indestructible ones
+                        blocked = self.hard_walls if player.disease == "walk_through_walls" else self.blocked_cells
+                        if player.has_kick and player.disease != "walk_through_walls":
+                            intended = player.intended_target()
+                            bomb = self.bombs.get(intended)
+                            if bomb is not None and bomb.move_dx == 0 and bomb.move_dy == 0:
+                                bomb.move_dx = intended[0] - player.col
+                                bomb.move_dy = intended[1] - player.row
+                            blocked = blocked - bomb_cells
 
-                    player.step(dt, blocked)
+                        player.step(dt, blocked)
 
-                self._update_kicked_bombs(dt)
-                self._update_flags()
-                self._update_power_ups(now)
-                self._update_diseases(now)
-                destroyed_walls = self._update_bombs(now)
+                    self._update_kicked_bombs(dt)
+                    self._update_flags()
+                    self._update_power_ups(now)
+                    self._update_diseases(now)
+                    destroyed_walls = self._update_bombs(now)
 
                 state = {
                     "type": "state",
                     "players": {
                         pid: {
-                            "x": p.x, "y": p.y, "color": p.color, "team": p.team, "cells": p.occupied_cells(),
+                            "x": p.x, "y": p.y, "color": p.color, "team": p.team, "name": p.name,
+                            "cells": p.occupied_cells(),
                             "bomb_capacity": p.bomb_capacity, "blast_range": p.blast_range,
                             "speed_bonus": p.speed_bonus, "disease": p.disease,
                             "has_kick": p.has_kick, "has_remote": p.has_remote,
@@ -803,7 +966,7 @@ class GameServer:
                     },
                     "scores": self.scores,
                     "winner": self.winner,
-                    "match_started": self.match_started,
+                    "phase": self.phase,
                 }
                 clients_snapshot = dict(self.clients)
 
