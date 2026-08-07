@@ -439,7 +439,10 @@ def run():
             scores = render_data["scores"]
             winner = render_data["winner"]
 
-            item_sprites = {"bomb": sprites.item_bomb, "fire": sprites.item_fire, "speed": sprites.item_speed}
+            item_sprites = {
+                "bomb": sprites.item_bomb, "fire": sprites.item_fire, "speed": sprites.item_speed,
+                "disease": sprites.item_disease, "timer": sprites.item_timer, "kick": sprites.item_kick,
+            }
             for power_up in power_ups:
                 kind = power_up["kind"]
                 pos = (power_up["col"] * settings.CELL_SIZE, power_up["row"] * settings.CELL_SIZE)

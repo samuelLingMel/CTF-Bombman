@@ -79,6 +79,9 @@ def load_sprites():
     s.item_bomb = pygame.transform.scale(_load("ItemExtraBomb.png"), tile_size)
     s.item_fire = pygame.transform.scale(_load("ItemBlastRadius.png"), tile_size)
     s.item_speed = pygame.transform.scale(_load("ItemSpeedIncrease.png"), tile_size)
+    s.item_disease = pygame.transform.scale(_load("ItemDisease.png"), tile_size)
+    s.item_timer = pygame.transform.scale(_load("ItemTimer.png"), tile_size)
+    s.item_kick = pygame.transform.scale(_load("ItemKick.png"), tile_size)
 
     s.player_walk = {}
     s.player_death = {}
